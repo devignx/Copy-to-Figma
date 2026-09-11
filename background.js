@@ -22,8 +22,8 @@ function restoreOriginalHref() {
   }
 }
 
-chrome.action.onClicked.addListener(async (tab) => {
-  if (!tab.id || !tab.url || !/^https?:\/\//.test(tab.url)) {
+async function captureTab(tab) {
+  if (!tab || !tab.id || !tab.url || !/^https?:\/\//.test(tab.url)) {
     return;
   }
 
@@ -49,5 +49,13 @@ chrome.action.onClicked.addListener(async (tab) => {
     });
   } catch (error) {
     console.error('Failed to run Figma capture script:', error);
+  }
+}
+
+chrome.action.onClicked.addListener(captureTab);
+
+chrome.commands.onCommand.addListener((command, tab) => {
+  if (command === 'copy-to-figma') {
+    captureTab(tab);
   }
 });

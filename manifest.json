@@ -14,6 +14,15 @@
   "action": {
     "default_title": "Copy to Figma"
   },
+  "commands": {
+    "copy-to-figma": {
+      "suggested_key": {
+        "default": "Alt+Shift+P",
+        "mac": "MacCtrl+Command+P"
+      },
+      "description": "Copy the current page to Figma"
+    }
+  },
   "background": {
     "service_worker": "background.js"
   },
