@@ -21,8 +21,10 @@ Pick the extension for reliability, the bookmarklet for zero-install / other bro
 ### Use
 
 1. Go to the page you want to capture.
-2. Click the **Copy to Figma** icon.
+2. Click the **Copy to Figma** icon, or press **Cmd+Option+O** (Mac) / **Ctrl+Alt+O** (Windows, Linux).
 3. Switch to Figma and paste.
+
+The shortcut only works in tabs loaded (or refreshed) after the extension was installed or reloaded.
 
 The extension injects `capture.js`, sets the capture fragment via `history.replaceState` (so the page does **not** reload and URL query params are kept), then restores the original URL.
 
@@ -35,6 +37,20 @@ The extension injects `capture.js`, sets the capture fragment via `history.repla
 ### Security note
 
 The extension removes CSP from all pages while enabled. Disable it in `chrome://extensions/` when done capturing.
+
+---
+
+## Toolbar
+
+Both the extension and the bookmarklet show the same toolbar:
+
+- **Entire screen** — copy the full page.
+- **Select element** — hover and click an element to copy just that element. Keyboard:
+  - **↑ / ↓** — move to the parent / back down to the child
+  - **← / →** — move to the previous / next sibling
+  - **Enter** — copy the highlighted element
+  - **Esc** — cancel
+- **Copy in 2s** — copy the full page after a 2 second countdown, so there's time to open a menu or hover state first.
 
 ---
 

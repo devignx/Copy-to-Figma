@@ -59,3 +59,10 @@ chrome.commands.onCommand.addListener((command, tab) => {
     captureTab(tab);
   }
 });
+
+// Cmd/Ctrl+Option+O, sent from shortcut.js.
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (message && message.type === 'copy-to-figma' && sender.tab) {
+    captureTab(sender.tab);
+  }
+});

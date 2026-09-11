@@ -16,13 +16,17 @@
   },
   "commands": {
     "copy-to-figma": {
-      "suggested_key": {
-        "default": "Alt+Shift+P",
-        "mac": "MacCtrl+Command+P"
-      },
       "description": "Copy the current page to Figma"
     }
   },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["shortcut.js"],
+      "all_frames": true,
+      "run_at": "document_start"
+    }
+  ],
   "background": {
     "service_worker": "background.js"
   },
