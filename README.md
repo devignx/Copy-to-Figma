@@ -38,6 +38,18 @@ The extension injects `capture.js`, sets the capture fragment via `history.repla
 
 The extension removes CSP from all pages while enabled. Disable it in `chrome://extensions/` when done capturing.
 
+### Iframes
+
+The extension also captures content inside iframes, including cross-origin ones (e.g. Claude artifacts, embeds). `background.js` injects `capture.js` and `frames.js` into every frame; each child frame serializes itself on request over `postMessage` and the parent grafts that tree under its `<iframe>` node, offset by the iframe's position. Not supported by the bookmarklet (it can't reach into cross-origin frames).
+
+Before each capture, `frames.js` makes the page self-contained for Figma, then restores it: it inlines `<svg><use>` icons (same-document, shadow DOM, external sprite files, nested), converts CSS `mask-image` icons to background images, and turns `::before`/`::after` that draw something (icon-font glyphs, boxes) into real elements. Each fix is isolated, so one failure can't block the others. Diagnostics print to the console as `[copy-to-figma]`.
+
+`capture.js` carries small patches so this works (`window.__h2dSerialize`, `__h2dMerge`, `__h2dPrepare`, `__h2dRestore`). If you replace it with a fresh copy from Figma, re-apply them: search the old file for `window.figma.captureForDesign=lr,`, `let n=yield Be(r),o=Math.round(n.length/1024)`, `h.log("Serializing DOM...");` and `h.log("Converting to JSON...");`.
+
+### Preferences
+
+The toolbar has a **⋯** button next to the close button. **Include Claude header** (on by default): turn it off and, on a page whose content is one big iframe (like a Claude artifact), only the artifact is pasted, without the Claude title bar. The setting is saved in `chrome.storage` and applies to the next capture (press *Entire screen* to re-capture right away).
+
 ---
 
 ## Toolbar

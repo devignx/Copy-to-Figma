@@ -1,7 +1,18 @@
-async function injectCaptureFile(tabId) {
+async function injectCaptureFile(tabId, allFrames = false) {
   await chrome.scripting.executeScript({
-    target: { tabId },
+    target: { tabId, allFrames },
     files: ['capture.js'],
+    world: 'MAIN'
+  });
+}
+
+// Sub-frames only need capture.js loaded (no hash, so they don't start their own
+// capture) plus frames.js, which lets the top frame pull their DOM into its payload.
+async function injectFrameSupport(tabId) {
+  await injectCaptureFile(tabId, true);
+  await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    files: ['frames.js'],
     world: 'MAIN'
   });
 }
@@ -22,13 +33,24 @@ function restoreOriginalHref() {
   }
 }
 
+async function applyPreferences(tabId) {
+  const prefs = await chrome.storage.local.get({ includeHeader: true });
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (p) => { window.__h2dPrefs = p; },
+    args: [prefs],
+    world: 'MAIN'
+  });
+}
+
 async function captureTab(tab) {
   if (!tab || !tab.id || !tab.url || !/^https?:\/\//.test(tab.url)) {
     return;
   }
 
   try {
-    await injectCaptureFile(tab.id);
+    await injectFrameSupport(tab.id);
+    await applyPreferences(tab.id);
 
     await new Promise((resolve) => setTimeout(resolve, 500));
 

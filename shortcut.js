@@ -12,3 +12,10 @@ window.addEventListener('keydown', (event) => {
   event.stopPropagation();
   chrome.runtime.sendMessage({ type: 'copy-to-figma' });
 }, true);
+
+// Preferences menu in the capture toolbar (MAIN world) asks us to persist settings.
+window.addEventListener('message', (event) => {
+  if (event.source !== window || !event.data || event.data.type !== 'h2d-set-pref') return;
+  const { includeHeader } = event.data.prefs || {};
+  if (typeof includeHeader === 'boolean') chrome.storage.local.set({ includeHeader });
+});
