@@ -16,10 +16,10 @@ window.addEventListener('keydown', (event) => {
 // Messages from the capture toolbar (MAIN world): persist preferences and release the resolution emulation when the toolbar closes.
 window.addEventListener('message', (event) => {
   if (event.source !== window || !event.data || window.parent !== window) return;
-  const { type, prefs } = event.data;
+  const { type, prefs, reason } = event.data;
   if (type === 'h2d-set-pref' && prefs) {
     chrome.storage.local.set(prefs);
   } else if (type === 'h2d-release') {
-    chrome.runtime.sendMessage({ type: 'h2d-release' });
+    chrome.runtime.sendMessage({ type: 'h2d-release', reason });
   }
 });

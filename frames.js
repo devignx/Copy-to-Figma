@@ -190,6 +190,63 @@
   }
 
 
+
+  // ---- Copy validation ------------------------------------------------------
+  // Runs right after the clipboard write. The debug/emulation session is only released
+  // once this passes (or the failure is shown), so we never end it on a bad copy.
+  window.__h2dValidateCopy = async (payloadStr) => {
+    const problems = [];
+    const notes = [];
+    try {
+      if (typeof payloadStr !== 'string' || payloadStr.length < 50) problems.push('payload is empty');
+      const payload = JSON.parse(payloadStr);
+      if (!payload.root || !payload.root.rect) problems.push('no root node in payload');
+      let nodes = 0;
+      (function count(n) { if (!n) return; nodes++; (n.childNodes || []).forEach(count); })(payload.root);
+      notes.push(nodes + ' nodes, ' + Math.round(payloadStr.length / 1024) + ' KB');
+      if (nodes < 2) problems.push('captured tree has ' + nodes + ' node(s)');
+
+      const res = prefs().resolution;
+      if (res && res.preset !== 'auto' && res.width >= 200 && res.height >= 200) {
+        const W = Math.round(res.width), H = Math.round(res.height);
+        const r = payload.root && payload.root.rect;
+        if (r && (Math.abs(r.width - W) > 1 || Math.abs(r.height - H) > 1)) {
+          problems.push('frame is ' + Math.round(r.width) + 'x' + Math.round(r.height) + ', expected ' + W + 'x' + H);
+        }
+        // The page must really have been laid out at the chosen width, not just the frame resized.
+        const vw = Number((window.__h2dVpStart || '').split('x')[0]);
+        if (vw && Math.abs(vw - W) > 1) {
+          problems.push('page was ' + window.__h2dVpStart + ' while capturing (not ' + W + ' wide), layout is not at the chosen size');
+        } else if (vw) {
+          notes.push('layout width ' + vw + ' matches');
+        }
+      }
+    } catch (error) {
+      problems.push('payload is not valid: ' + error.message);
+    }
+
+    // Read the clipboard back when the page already has permission (never prompts).
+    try {
+      const perm = await navigator.permissions.query({ name: 'clipboard-read' });
+      if (perm.state === 'granted') {
+        const items = await navigator.clipboard.read();
+        let html = '';
+        for (const item of items) if (item.types.includes('text/html')) html = await (await item.getType('text/html')).text();
+        if (!html.includes('figh2d')) problems.push('clipboard does not contain the Figma payload');
+        else notes.push('clipboard read-back OK');
+      } else {
+        notes.push('clipboard read-back skipped (no permission)');
+      }
+    } catch (error) {
+      notes.push('clipboard read-back skipped');
+    }
+
+    const ok = problems.length === 0;
+    window.__h2dValidation = (ok ? 'OK' : 'FAILED') + ' | ' + notes.join('; ') + (ok ? '' : ' | ' + problems.join('; '));
+    console.log('[copy-to-figma] copy validation: ' + window.__h2dValidation);
+    return { ok, message: 'Copied, but check failed: ' + problems.join('; ') };
+  };
+
   // ---- Preferences menu (three dots next to the toolbar's close button) -----
   const PREF_DEFAULTS = { includeHeader: true, resolution: { preset: 'auto', width: 1440, height: 900 } };
   const PRESETS = [
@@ -369,6 +426,7 @@
       const rep = document.createElement('div');
       Object.assign(rep.style, { marginTop: '10px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,.15)' });
       const lines = [].concat(
+        window.__h2dValidation ? ['COPY VALIDATION: ' + window.__h2dValidation] : [],
         window.__h2dTop ? ['TOP | ' + JSON.stringify(window.__h2dTop)] : [],
         window.__h2dReport && window.__h2dReport.length ? window.__h2dReport : ['(no iframes captured)']
       );
@@ -397,7 +455,7 @@
       document.addEventListener('pointerdown', onOutside, true);
     };
 
-    closeButton.addEventListener('click', () => window.postMessage({ type: 'h2d-release' }, '*'));
+    closeButton.addEventListener('click', () => window.postMessage({ type: 'h2d-release', reason: 'close-button' }, '*'));
     wrap.append(dots, closeButton);
     return wrap;
   };
@@ -582,6 +640,7 @@
   };
 
   window.__h2dPrepare = async () => {
+    if (window === window.top) window.__h2dVpStart = innerWidth + 'x' + innerHeight;
     window.__h2dRestore();
     if (window.__h2dSkipPrepare) return;
     const started = Date.now();
@@ -680,7 +739,7 @@
 
   // Called by capture.js with the JSON payload for this frame; returns JSON with
   // each iframe's content attached under its IFRAME node.
-  window.__h2dMerge = async (json) => {
+  const mergeFrames = async (json) => {
     window.__h2dReport = [];
     const iframes = collectIframes(document);
     if (!iframes.length) return json;
@@ -809,5 +868,38 @@
       if (soloChild.documentTitle) payload.documentTitle = soloChild.documentTitle;
     }
     return JSON.stringify(payload);
+  };
+
+  // Entry point used by capture.js: merge iframe content, then, when a custom resolution is
+  // active, make the pasted root frame exactly that size (Figma otherwise sizes it from the
+  // page's content, which is rarely the viewport size).
+  window.__h2dMerge = async (json) => {
+    const merged = await mergeFrames(json);
+    if (window !== window.top) return merged;
+    const res = prefs().resolution;
+    const custom = res && res.preset !== 'auto' && res.width >= 200 && res.height >= 200;
+    window.__h2dReport.push('VIEWPORT at serialize start ' + (window.__h2dVpStart || '?'));
+    window.__h2dReport.push('EMULATION: ' + (prefs().emulation || 'n/a'));
+    window.__h2dReport.push('VIEWPORT at capture ' + innerWidth + 'x' + innerHeight + ' (dpr ' + devicePixelRatio + ')' + (custom ? ', target ' + res.width + 'x' + res.height : ', no custom size'));
+    console.log('[copy-to-figma] viewport at capture: ' + innerWidth + 'x' + innerHeight + (custom ? ' | target ' + res.width + 'x' + res.height : ' | no custom size'));
+    if (!custom) return merged;
+    try {
+      const payload = JSON.parse(merged);
+      const root = payload.root;
+      if (!root || !root.rect) return merged;
+      const W = Math.round(res.width);
+      const H = Math.round(res.height);
+      root.rect.width = W;
+      root.rect.height = H;
+      if (root.rect.cssWidth != null) root.rect.cssWidth = W;
+      if (root.rect.cssHeight != null) root.rect.cssHeight = H;
+      root.styles = Object.assign({}, root.styles, { overflow: 'hidden', overflowX: 'hidden', overflowY: 'hidden' });
+      payload.documentRect = { x: 0, y: 0, width: W, height: H };
+      payload.viewportRect = { x: 0, y: 0, width: W, height: H };
+      return JSON.stringify(payload);
+    } catch (error) {
+      console.warn('[copy-to-figma] could not apply resolution', error);
+      return merged;
+    }
   };
 })();
