@@ -7,7 +7,7 @@
   const REQ = 'h2d-frame-request';
   const RES = 'h2d-frame-response';
   const ACK = 'h2d-frame-ack';
-  const ACK_TIMEOUT_MS = 2500;
+  const ACK_TIMEOUT_MS = 1500;
   const ARMED_MS = 120000;
   const CHILD_TIMEOUT_MS = 20000;
 
@@ -214,11 +214,11 @@
           problems.push('frame is ' + Math.round(r.width) + 'x' + Math.round(r.height) + ', expected ' + W + 'x' + H);
         }
         // The page must really have been laid out at the chosen width, not just the frame resized.
-        const vw = Number((window.__h2dVpStart || '').split('x')[0]);
-        if (vw && Math.abs(vw - W) > 1) {
-          problems.push('page was ' + window.__h2dVpStart + ' while capturing (not ' + W + ' wide), layout is not at the chosen size');
+        const [vw, vh] = (window.__h2dVpStart || '').split('x').map(Number);
+        if (vw && (Math.abs(vw - W) > 1 || Math.abs(vh - H) > 1)) {
+          problems.push('page was ' + window.__h2dVpStart + ' while capturing (not ' + W + 'x' + H + '), layout is not at the chosen size');
         } else if (vw) {
-          notes.push('layout width ' + vw + ' matches');
+          notes.push('layout ' + vw + 'x' + vh + ' matches');
         }
       }
     } catch (error) {
@@ -227,9 +227,9 @@
 
     // Read the clipboard back when the page already has permission (never prompts).
     try {
-      const perm = await navigator.permissions.query({ name: 'clipboard-read' });
+      const perm = await Promise.race([navigator.permissions.query({ name: 'clipboard-read' }), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 500))]);
       if (perm.state === 'granted') {
-        const items = await navigator.clipboard.read();
+        const items = await Promise.race([navigator.clipboard.read(), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1000))]);
         let html = '';
         for (const item of items) if (item.types.includes('text/html')) html = await (await item.getType('text/html')).text();
         if (!html.includes('figh2d')) problems.push('clipboard does not contain the Figma payload');
@@ -241,6 +241,7 @@
       notes.push('clipboard read-back skipped');
     }
 
+    notes.push('timing: setup ' + (prefs().t0 || 0) + 'ms before page script, copy finished ' + Math.round(performance.now() - (window.__h2dPageT0 || performance.now())) + 'ms after capture start');
     const ok = problems.length === 0;
     window.__h2dValidation = (ok ? 'OK' : 'FAILED') + ' | ' + notes.join('; ') + (ok ? '' : ' | ' + problems.join('; '));
     console.log('[copy-to-figma] copy validation: ' + window.__h2dValidation);
@@ -427,6 +428,7 @@
       Object.assign(rep.style, { marginTop: '10px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,.15)' });
       const lines = [].concat(
         window.__h2dValidation ? ['COPY VALIDATION: ' + window.__h2dValidation] : [],
+        ['RELEASE (this copy): ' + (window.__h2dReleaseNote || 'not finished yet, reopen this menu in a few seconds')],
         window.__h2dTop ? ['TOP | ' + JSON.stringify(window.__h2dTop)] : [],
         window.__h2dReport && window.__h2dReport.length ? window.__h2dReport : ['(no iframes captured)']
       );
@@ -455,7 +457,7 @@
       document.addEventListener('pointerdown', onOutside, true);
     };
 
-    closeButton.addEventListener('click', () => window.postMessage({ type: 'h2d-release', reason: 'close-button' }, '*'));
+    closeButton.addEventListener('click', () => window.postMessage({ type: 'h2d-release', reason: 'close-button', at: Date.now() }, '*'));
     wrap.append(dots, closeButton);
     return wrap;
   };
@@ -640,7 +642,7 @@
   };
 
   window.__h2dPrepare = async () => {
-    if (window === window.top) window.__h2dVpStart = innerWidth + 'x' + innerHeight;
+    if (window === window.top) { window.__h2dVpStart = innerWidth + 'x' + innerHeight; window.__h2dPageT0 = performance.now(); }
     window.__h2dRestore();
     if (window.__h2dSkipPrepare) return;
     const started = Date.now();

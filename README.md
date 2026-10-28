@@ -26,7 +26,7 @@ Pick the extension for reliability, the bookmarklet for zero-install / other bro
 
 The shortcut only works in tabs loaded (or refreshed) after the extension was installed or reloaded.
 
-The extension injects `capture.js`, sets the capture fragment via `history.replaceState` (so the page does **not** reload and URL query params are kept), then restores the original URL.
+The extension injects `capture.js` into the page and its frames, then starts the capture by calling `window.figma.captureForDesign()` directly, so the page is not reloaded and the URL is never touched.
 
 ### After editing extension code
 
@@ -50,7 +50,7 @@ Before each capture, `frames.js` makes the page self-contained for Figma, then r
 
 The toolbar has a **⋯** button next to the close button. **Include Claude header** (on by default): turn it off and, on a page whose content is one big iframe (like a Claude artifact), only the artifact is pasted, without the Claude title bar. The setting is saved in `chrome.storage` and applies to the next capture (press *Entire screen* to re-capture right away).
 
-**Resolution** (also in the ⋯ menu): pick a preset (1920×1080, 1440×900, 1280×800, 1024×768, tablet, mobile) or enter a custom width × height, The choice saves automatically, and the pasted root frame is set to exactly that width × height (content beyond it is clipped). The extension resizes the page's viewport with Chrome's device emulation (the `debugger` permission), so media queries and layouts reflow, captures, and restores the original size as soon as the capture is copied. The debug session (and the browser's debugging bar) exists only for the duration of each copy: it is released only after the copy is validated (payload has content, the frame and page layout match the chosen size, and the clipboard is read back when permitted), or when an error is shown, with a 30-second safety timeout. A failed check shows an error toast and `COPY VALIDATION` in the ⋯ report. The chosen size also applies to every normal copy (icon / Cmd+Option+O) until you set it back to *Current window*. A 45px buffer is added to the height to cover the browser's debugging infobar.
+**Resolution** (also in the ⋯ menu): pick a preset (1920×1080, 1440×900, 1280×800, 1024×768, tablet, mobile) or enter a custom width × height, The choice saves automatically, and the pasted root frame is set to exactly that width × height (content beyond it is clipped). The extension resizes the page's viewport with Chrome's device emulation (the `debugger` permission), so media queries and layouts reflow, captures, and restores the original size as soon as the capture is copied. The debug session (and the browser's debugging bar) exists only for the duration of each copy: it is released only after the copy is validated (payload has content, the frame and page layout match the chosen size, and the clipboard is read back when permitted), or when an error is shown, with a 30-second safety timeout. A failed check shows an error toast and `COPY VALIDATION` in the ⋯ report. The chosen size also applies to every normal copy (icon / Cmd+Option+O) until you set it back to *Current window*.
 
 **Set preferences without capturing first:** right-click the extension icon → *Options* (or `chrome://extensions` → Details → Extension options). Header and resolution live there too. Chrome shows a "started debugging this browser" bar while it's active, and it won't work while DevTools is open on the same tab.
 

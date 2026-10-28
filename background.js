@@ -17,52 +17,64 @@ async function injectFrameSupport(tabId) {
   });
 }
 
-// Set the capture fragment WITHOUT firing `hashchange`, so SPA hash-routers
-// don't re-navigate and drop the URL query params. Stash the original URL so
-// we can restore it after capture.js has read the hash.
-function setFigmaCaptureHash() {
-  window.__figmaOriginalHref = window.location.href;
-  const base = window.location.href.split('#')[0];
-  history.replaceState(null, '', base + '#figmacapture&figmadelay=1000');
-}
-
-function restoreOriginalHref() {
-  if (window.__figmaOriginalHref) {
-    history.replaceState(null, '', window.__figmaOriginalHref);
-    delete window.__figmaOriginalHref;
-  }
-}
-
 const DEFAULT_PREFS = { includeHeader: true, resolution: { preset: 'auto', width: 1440, height: 900 } };
 
 // ---- Resolution: emulate the viewport size via the debugger protocol ----
-// Chrome/Brave's "started debugging this browser" infobar takes this much height off
-// the viewport once attached, so emulate that much extra to land on the requested size.
-const INFOBAR_BUFFER = 45;
+// Extra height added to the emulated viewport. 0: device emulation sets the page's viewport
+// exactly (the page reports the override size), the debugging infobar does not take any of it.
+const INFOBAR_BUFFER = 0;
 const emulated = new Set();
 const releaseTimers = new Map();
 const MAX_EMULATION_MS = 30000; // safety net if the page never reports completion
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function clearResolution(tabId, { keepTimer = false } = {}) {
+  if (closing.has(tabId)) return null; // a release is already running (duplicate triggers)
+  const tStart = Date.now();
+  closing.add(tabId); // also stops any in-flight re-apply from re-attaching
   clearInterval(keepAlive.get(tabId));
   keepAlive.delete(tabId);
+  emulated.delete(tabId);
+  // Detach first: it removes the debugging bar at once and Chrome resets the emulation by
+  // itself. Waiting for an explicit "clear override" made the page re-layout before the
+  // detach, which on a big page took seconds. Do not trust in-memory state (the service
+  // worker may have restarted): always try, then confirm and retry.
+  let detachResult = 'ok';
+  const detach = async () => { try { await chrome.debugger.detach({ tabId }); detachResult = 'ok'; } catch (e) { detachResult = 'error: ' + (e && e.message ? e.message : e); } };
+  await detach();
+  const detachMs = Date.now() - tStart;
   if (!keepTimer) {
     clearTimeout(releaseTimers.get(tabId));
     releaseTimers.delete(tabId);
-    await restoreWindow(tabId);
+    restoreWindow(tabId); // only does anything after the window-resize fallback
   }
-  if (!emulated.has(tabId)) return;
-  emulated.delete(tabId);
-  try { await chrome.debugger.sendCommand({ tabId }, 'Emulation.clearDeviceMetricsOverride'); } catch (e) { /* tab gone */ }
-  try { await chrome.debugger.detach({ tabId }); } catch (e) { /* already detached */ }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let stillAttached = false;
+    try {
+      const targets = await chrome.debugger.getTargets();
+      stillAttached = targets.some((t) => t.tabId === tabId && t.attached);
+    } catch (e) { /* ignore */ }
+    if (!stillAttached) break;
+    await sleep(100);
+    await detach();
+  }
+  closing.delete(tabId);
+  return { detachMs, totalMs: Date.now() - tStart, detachResult };
 }
 
 const emulationStatus = new Map();
+const detachedAt = new Map(); // tabId -> time of Chrome's own "detached" event
 const captureStartedAt = new Map(); // tabId -> ms, ignore re-triggers while a capture is running
 const lastRelease = new Map(); // tabId -> text describing what ended the previous emulation
+const saveReleaseNote = (tabId, text) => {
+  lastRelease.set(tabId, text);
+  chrome.storage.local.set({ lastReleaseNote: text });
+  // Also hand it to the open page so this copy's own report (⋯ menu) shows it.
+  chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', args: [text], func: (t) => { window.__h2dReleaseNote = t; } }).catch(() => {});
+};
 const CAPTURE_LOCK_MS = 25000;
 const keepAlive = new Map(); // tabId -> interval id
+const closing = new Set(); // tabs being released right now
 const userCancelled = new Set(); // tabs where the user dismissed the debugging bar
 const savedWindows = new Map(); // tabId -> { windowId, bounds } to restore after the copy
 
@@ -89,11 +101,13 @@ async function tryEmulation(tabId, width, height) {
     emulated.add(tabId);
   }
   let metrics;
-  for (let i = 0; i < 5; i++) {
+  for (let round = 0; round < 4; round++) {
     await sendOverride(tabId, width, height);
-    await sleep(350);
-    metrics = await pageMetrics(tabId);
-    if (Math.abs(metrics.iw - width) <= 1) return { ok: true, metrics };
+    for (let i = 0; i < 15; i++) { // up to ~600ms per round
+      await sleep(40);
+      metrics = await pageMetrics(tabId);
+      if (Math.abs(metrics.iw - width) <= 1) return { ok: true, metrics };
+    }
   }
   return { ok: false, metrics };
 }
@@ -151,22 +165,30 @@ async function applyResolution(tab, resolution) {
     releaseTimers.set(tabId, setTimeout(() => clearResolution(tabId), MAX_EMULATION_MS));
     const emu = await tryEmulation(tabId, width, height);
     if (emu.ok) {
-      emulationStatus.set(tabId, 'device emulation OK, page reports ' + emu.metrics.iw + 'x' + emu.metrics.ih + ' (re-applied every 400ms during capture)');
+      emulationStatus.set(tabId, 'device emulation OK, page reports ' + emu.metrics.iw + 'x' + emu.metrics.ih + ' (re-applied only if the page drifts)');
       // Something (the browser or the page) can reset the override while the capture scripts
       // load, so keep re-asserting it until the copy finishes and we release.
       userCancelled.delete(tabId);
       clearInterval(keepAlive.get(tabId));
       keepAlive.set(tabId, setInterval(async () => {
-        if (userCancelled.has(tabId)) return;
+        if (userCancelled.has(tabId) || closing.has(tabId) || !keepAlive.has(tabId)) return;
         try {
           if (!emulated.has(tabId)) {
             await chrome.debugger.attach({ tabId }, '1.3');
             emulated.add(tabId);
+            if (closing.has(tabId) || !keepAlive.has(tabId)) { // released while attaching
+              emulated.delete(tabId);
+              await chrome.debugger.detach({ tabId });
+              return;
+            }
           }
-          await sendOverride(tabId, width, height);
+          const m = await pageMetrics(tabId);
+          if (Math.abs(m.iw - width) > 1 || Math.abs(m.ih - (height + INFOBAR_BUFFER)) > 1) {
+            await sendOverride(tabId, width, height);
+          }
         } catch (e) { /* tab closed or debugger busy */ }
       }, 400));
-      await sleep(400);
+      await sleep(150);
       return;
     }
     // Emulation did not change the page: drop the debug session and resize the window instead.
@@ -175,7 +197,7 @@ async function applyResolution(tab, resolution) {
     const after = await tryWindowResize(tab, width, height);
     emulationStatus.set(tabId, 'device emulation had no effect (page stayed ' + reported + '); window resize -> page reports ' +
       after.iw + 'x' + after.ih);
-    await sleep(400);
+    await sleep(150);
   } catch (error) {
     console.warn('Could not set resolution:', error);
     emulationStatus.set(tabId, 'FAILED: ' + (error && error.message ? error.message : String(error)));
@@ -183,6 +205,7 @@ async function applyResolution(tab, resolution) {
 }
 
 chrome.debugger.onDetach.addListener((source, reason) => {
+  detachedAt.set(source.tabId, Date.now());
   emulated.delete(source.tabId);
   if (reason === 'canceled_by_user') {
     userCancelled.add(source.tabId);
@@ -193,16 +216,39 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 chrome.tabs.onRemoved.addListener((tabId) => emulated.delete(tabId));
 
 async function applyPreferences(tabId) {
-  const prefs = await chrome.storage.local.get(DEFAULT_PREFS);
+  const prefs = await chrome.storage.local.get(Object.assign({ lastReleaseNote: '' }, DEFAULT_PREFS));
   await chrome.scripting.executeScript({
     target: { tabId },
     func: (p) => { window.__h2dPrefs = p; },
-    args: [Object.assign({}, prefs, { emulation: (emulationStatus.get(tabId) || 'unknown') + ' | previous copy ended by: ' + (lastRelease.get(tabId) || 'n/a') })],
+    args: [Object.assign({}, prefs, { t0: Date.now() - (captureStartedAt.get(tabId) || Date.now()), emulation: (emulationStatus.get(tabId) || 'unknown') + ' | previous copy ended by: ' + (lastRelease.get(tabId) || prefs.lastReleaseNote || 'n/a') })],
     world: 'MAIN'
   });
 }
 
+// Independent of the message relay: poll the page for "copy finished" and release at once.
+async function watchForCopy(tabId) {
+  const started = Date.now();
+  while (Date.now() - started < MAX_EMULATION_MS) {
+    await sleep(100);
+    if (!emulated.has(tabId) && !savedWindows.has(tabId) && !keepAlive.has(tabId)) return; // already released
+    try {
+      const [r] = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: () => !!window.__h2dDone });
+      if (r && r.result) {
+        const seenAt = Date.now();
+        captureStartedAt.delete(tabId);
+        const t = await clearResolution(tabId);
+        saveReleaseNote(tabId, 'watcher, copy seen ' + ((seenAt - started) / 1000).toFixed(2) + 's after capture start' +
+          (t ? '; detach took ' + t.detachMs + 'ms, release total ' + t.totalMs + 'ms' : ''));
+        return;
+      }
+    } catch (e) {
+      return; // tab closed / not scriptable; the timeout path still releases
+    }
+  }
+}
+
 async function captureTab(tab) {
+  const t0 = Date.now();
   if (!tab || !tab.id || !tab.url || !/^https?:\/\//.test(tab.url)) {
     return;
   }
@@ -217,27 +263,24 @@ async function captureTab(tab) {
 
   try {
     const { resolution } = await chrome.storage.local.get(DEFAULT_PREFS);
-    await applyResolution(tab, resolution);
-    await injectFrameSupport(tab.id);
+    // Injecting the scripts does not depend on the viewport, so do it while the size is applied.
+    await Promise.all([applyResolution(tab, resolution), injectFrameSupport(tab.id)]);
     await applyPreferences(tab.id);
 
-    await new Promise((resolve) => setTimeout(resolve, 500));
-
+    // The page was already settled by the size check, so it needs less time before reading.
+    const delay = emulated.has(tab.id) || savedWindows.has(tab.id) ? 150 : 400;
+    // Start the capture directly (capture.js is already loaded in every frame).
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      func: setFigmaCaptureHash,
-      world: 'MAIN'
+      world: 'MAIN',
+      args: [delay],
+      func: (d) => {
+        window.__h2dDone = 0;
+        window.figma.captureForDesign({ delayMs: d });
+      }
     });
 
-    // capture.js reads location.hash synchronously at load, then awaits its
-    // own delay — so the URL can be restored right after this inject.
-    await injectCaptureFile(tab.id);
-
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: restoreOriginalHref,
-      world: 'MAIN'
-    });
+    watchForCopy(tab.id); // not awaited: runs until the copy finishes
   } catch (error) {
     captureStartedAt.delete(tab.id);
     console.error('Failed to run Figma capture script:', error);
@@ -265,8 +308,19 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   if (message && message.type === 'h2d-release' && sender.tab) {
     const tabId = sender.tab.id;
     const started = captureStartedAt.get(tabId);
-    lastRelease.set(tabId, (message.reason || 'unknown') + ' after ' + (started ? ((Date.now() - started) / 1000).toFixed(1) + 's' : '?'));
+    const gotAt = Date.now();
     captureStartedAt.delete(tabId);
-    clearResolution(tabId);
+    detachedAt.delete(tabId);
+    clearResolution(tabId).then((t) => {
+      if (!t) return; // duplicate trigger, the first one is reporting
+      const d = detachedAt.get(tabId);
+      const ms = (x) => (typeof x === 'number' ? Math.round(x) + 'ms' : '?');
+      saveReleaseNote(tabId, (message.reason || 'unknown') +
+        ' | page signal -> content script ' + ms(message.relayedAt - message.at) +
+        ' -> background ' + ms(gotAt - message.relayedAt) +
+        ' | detach call ' + t.detachMs + 'ms (' + t.detachResult + '), Chrome detached event ' + (d ? ms(d - message.at) + ' after the signal' : 'not seen') +
+        ' | release total ' + t.totalMs + 'ms' +
+        (started ? ' | signal ' + ((message.at - started) / 1000).toFixed(2) + 's after capture start' : ''));
+    });
   }
 });
