@@ -3,7 +3,7 @@ const PRESETS = [
   ['1280x800', 'Laptop 1280 × 800', 1280, 800], ['1024x768', 'Small 1024 × 768', 1024, 768], ['768x1024', 'Tablet 768 × 1024', 768, 1024],
   ['390x844', 'Mobile 390 × 844', 390, 844], ['custom', 'Custom…', 0, 0]
 ];
-const DEFAULTS = { includeHeader: true, resolution: { preset: 'auto', width: 1440, height: 900 } };
+const DEFAULTS = { includeHeader: true, resolution: { preset: 'auto', width: 1440, height: 900 }, sendToClause: true, clauseUrl: 'http://localhost:8787' };
 
 const $ = (id) => document.getElementById(id);
 const preset = $('preset');
@@ -37,14 +37,19 @@ function readResolution() {
 async function save() {
   const resolution = readResolution();
   sync(resolution);
-  await chrome.storage.local.set({ includeHeader: $('includeHeader').checked, resolution });
+  const url = ($('clauseUrl').value || '').trim() || DEFAULTS.clauseUrl;
+  await chrome.storage.local.set({ includeHeader: $('includeHeader').checked, resolution, sendToClause: $('sendToClause').checked, clauseUrl: url });
   flash();
 }
 
 chrome.storage.local.get(DEFAULTS).then((prefs) => {
   $('includeHeader').checked = prefs.includeHeader;
   sync(prefs.resolution);
+  $('sendToClause').checked = prefs.sendToClause;
+  $('clauseUrl').value = prefs.clauseUrl;
 });
 $('includeHeader').onchange = save;
+$('sendToClause').onchange = save;
+$('clauseUrl').onchange = save;
 preset.onchange = save;
 $('width').onchange = $('height').onchange = save;

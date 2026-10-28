@@ -38,6 +38,10 @@ The extension injects `capture.js` into the page and its frames, then starts the
 
 The extension removes CSP from all pages while enabled. Disable it in `chrome://extensions/` when done capturing.
 
+### Send to Figma automatically (Clause)
+
+With the [Clause](https://github.com/hari-icd/clause) server running (`npm run live`) and **Clause Assist** open in Figma, every successful copy also tells the Clause server to paste into Figma for you: Figma briefly comes forward, pastes, and focus returns to the browser (macOS; needs Accessibility permission for the app running the server). A green ✓ badge on the toolbar icon confirms the hand-off; an orange ! with a tooltip says what to fix. Turn it off or change the server address in Options (`sendToClause`, `clauseUrl`). If Clause isn't running nothing happens and the copy stays on your clipboard.
+
 ### Iframes
 
 The extension also captures content inside iframes, including cross-origin ones (e.g. Claude artifacts, embeds). `background.js` injects `capture.js` and `frames.js` into every frame; each child frame serializes itself on request over `postMessage` and the parent grafts that tree under its `<iframe>` node, offset by the iframe's position. Not supported by the bookmarklet (it can't reach into cross-origin frames).

@@ -260,12 +260,15 @@ async function captureTab(tab) {
     return;
   }
   captureStartedAt.set(tab.id, Date.now());
+  clausePing(); // tell Clause the extension is alive (the plugin shows it as connected)
 
   try {
     const { resolution } = await chrome.storage.local.get(DEFAULT_PREFS);
     // Injecting the scripts does not depend on the viewport, so do it while the size is applied.
     await Promise.all([applyResolution(tab, resolution), injectFrameSupport(tab.id)]);
     await applyPreferences(tab.id);
+    const stageIt = (await clauseMode()) === 'stage';
+    stageTabs.set(tab.id, stageIt);
 
     // The page was already settled by the size check, so it needs less time before reading.
     const delay = emulated.has(tab.id) || savedWindows.has(tab.id) ? 150 : 400;
@@ -273,9 +276,21 @@ async function captureTab(tab) {
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       world: 'MAIN',
-      args: [delay],
-      func: (d) => {
+      args: [delay, stageIt],
+      func: (d, stage) => {
         window.__h2dDone = 0;
+        window.__h2dLastHtml = '';
+        // Staging: keep a copy of what goes onto the clipboard so Clause can queue it (the clipboard itself is still written as usual)
+        if (stage && !window.__h2dClipWrapped && navigator.clipboard && navigator.clipboard.write) {
+          window.__h2dClipWrapped = true;
+          const orig = navigator.clipboard.write.bind(navigator.clipboard);
+          navigator.clipboard.write = async (items) => {
+            try {
+              for (const it of items) if (it.types && it.types.includes('text/html')) window.__h2dLastHtml = await (await it.getType('text/html')).text();
+            } catch (e) { /* the normal copy still goes ahead */ }
+            return orig(items);
+          };
+        }
         window.figma.captureForDesign({ delayMs: d });
       }
     });
@@ -304,9 +319,153 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 
 // The capture toolbar tells us when the copy is finished (or failed) so the debug
 // session, and its infobar, only exists while a capture is running.
+// ---- Hand the copy to Figma through the Clause server (see Clause: scripts/webpaste.mjs) ----
+const CLAUSE_DEFAULTS = { sendToClause: true, clauseUrl: 'http://localhost:8787' };
+
+function flashBadge(tabId, text, color, title) {
+  chrome.action.setBadgeBackgroundColor({ color });
+  chrome.action.setBadgeText({ text, tabId });
+  if (title) chrome.action.setTitle({ title, tabId });
+  setTimeout(() => {
+    chrome.action.setBadgeText({ text: '', tabId }).catch(() => {});
+    chrome.action.setTitle({ title: 'Copy to Figma', tabId }).catch(() => {});
+  }, 4000);
+}
+
+// ---- In-page validation: toasts in the captured page itself, driven by Clause's live status ----
+const clauseBase = async () => (await chrome.storage.local.get(CLAUSE_DEFAULTS)).clauseUrl.replace(/\/$/, '');
+
+function clauseToast(tabId, payload) {
+  const msg = Object.assign({ type: 'clause-toast' }, payload);
+  chrome.tabs.sendMessage(tabId, msg, { frameId: 0 }).catch(async () => {
+    // No toast script in this tab: it was open before the extension was loaded or reloaded. Put it there and try once more.
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['shortcut.js'] });
+      await chrome.tabs.sendMessage(tabId, msg, { frameId: 0 });
+    } catch (e) { /* a page we may not script (chrome://, the Web Store): nothing to show */ }
+  });
+}
+
+let lastPing = 0;
+async function clausePing() {
+  if (Date.now() - lastPing < 20000) return;
+  lastPing = Date.now();
+  try {
+    const { sendToClause } = await chrome.storage.local.get(CLAUSE_DEFAULTS);
+    if (!sendToClause) return;
+    await fetch((await clauseBase()) + '/capture/ping', { method: 'POST', headers: { 'content-type': 'application/json', 'x-clause': '1' }, body: '{}' });
+  } catch (e) { /* Clause is not running: nothing to say */ }
+}
+chrome.tabs.onActivated.addListener(() => { clausePing(); });
+chrome.runtime.onStartup.addListener(() => { clausePing(); });
+clausePing();
+
+// Paste switched off in Clause Assist: stay completely quiet (no toast, no badge): the copy is on the clipboard as usual.
+async function clauseOff() {
+  try { const st = await fetch((await clauseBase()) + '/capture/status').then((r) => r.json()); return !!st && st.enabled === false; } catch (e) { return false; }
+}
+
+// Staging: when Clause Assist is in "Stage, paste all" mode the copy is queued in Clause instead of pasted right away.
+const stageTabs = new Map();
+async function clauseMode() {
+  try {
+    const { sendToClause } = await chrome.storage.local.get(CLAUSE_DEFAULTS);
+    if (!sendToClause) return 'now';
+    const st = await fetch((await clauseBase()) + '/capture/status').then((r) => r.json());
+    return st && st.enabled && st.mode === 'stage' ? 'stage' : 'now';
+  } catch (e) { return 'now'; }
+}
+
+async function stageClause(tabId) {
+  const base = await clauseBase();
+  clauseToast(tabId, { state: 'working', title: 'Adding to the queue…', sub: 'Saving this page in Clause' });
+  try {
+    const [r] = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: () => window.__h2dLastHtml || '' });
+    const html = (r && r.result) || '';
+    if (!html) return clauseToast(tabId, { state: 'warn', title: 'Could not queue this page', sub: 'The capture was copied to your clipboard (⌘V in Figma).' });
+    const tab = await chrome.tabs.get(tabId);
+    const res = await fetch(base + '/capture/stage', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-clause': '1' },
+      body: JSON.stringify({ title: tab.title || tab.url, url: tab.url, html })
+    });
+    const info = await res.json().catch(() => ({}));
+    if (res.ok) {
+      flashBadge(tabId, String(info.queued), '#1f6feb', info.queued + ' page' + (info.queued === 1 ? '' : 's') + ' queued in Clause');
+      return clauseToast(tabId, { state: 'ok', title: 'Added to the queue · ' + info.queued + ' ready', sub: 'Copy more pages, then press Paste all in Clause Assist.' });
+    }
+    if (res.status === 409) return clauseToast(tabId, { state: 'hide' });
+    flashBadge(tabId, '!', '#bf6a02', info.hint || 'Clause did not queue (' + res.status + ')');
+    clauseToast(tabId, { state: 'warn', title: 'Could not queue this page', sub: info.hint || 'Error ' + res.status + '. The capture is on your clipboard (⌘V in Figma).' });
+  } catch (e) {
+    clauseToast(tabId, { state: 'warn', title: 'Copied — Clause isn’t running', sub: 'Press ⌘V in Figma, or start Clause (npm run live).' });
+  }
+}
+
+async function notifyClause(tabId) {
+  const { sendToClause } = await chrome.storage.local.get(CLAUSE_DEFAULTS);
+  if (!sendToClause) return;
+  if (await clauseOff()) { stageTabs.delete(tabId); return; }
+  if (stageTabs.get(tabId)) { stageTabs.delete(tabId); return stageClause(tabId); }
+  const base = await clauseBase();
+  const started = Date.now();
+  clauseToast(tabId, { state: 'working', title: 'Sending to Figma…', sub: 'Clause is pasting the page into your open file' });
+  try {
+    // The page is already on the clipboard; this only says "paste it now".
+    const res = await fetch(base + '/capture/paste', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-clause': '1' },
+      body: '{}'
+    });
+    const info = await res.json().catch(() => ({}));
+    if (res.status === 409) return clauseToast(tabId, { state: 'hide' }); // switched off in the plugin: say nothing
+    if (!res.ok) {
+      flashBadge(tabId, '!', '#bf6a02', info.hint || 'Clause did not paste (' + res.status + ')');
+      return clauseToast(tabId, { state: 'err', title: 'Clause could not paste', sub: info.hint || 'Error ' + res.status + '. The page is on your clipboard (⌘V in Figma).' });
+    }
+    if (info.skipped) return clauseToast(tabId, { state: 'working', title: 'Already pasting…', sub: 'One capture at a time' });
+    // wait for the verdict: Clause reports busy → pasted → how many layers landed
+    let st = null, doneAt = 0, told = false, cancelled = false;
+    for (let i = 0; i < 330; i++) { // up to ~2 min: Clause may be waiting for a click on the Figma canvas
+      await sleep(400);
+      st = await fetch(base + '/capture/status').then((r) => r.json()).catch(() => null);
+      if (st && st.awaiting && !told) { told = true; clauseToast(tabId, { state: 'working', title: 'Click on the canvas in Figma', sub: 'The page is pasted as soon as you click the canvas.' }); }
+      if (st && !st.awaiting && told && !st.busy && (!st.last || st.last.at < started)) { cancelled = true; break; } // the paste was cancelled in the plugin
+      const l = st && st.last;
+      if (st && !st.busy && l && l.at >= started) {
+        if (l.ok === false) break;
+        if (typeof l.count === 'number') break;
+        if (!doneAt) doneAt = Date.now();
+        if (Date.now() - doneAt > 5000) break; // the plugin did not report a count: the paste itself went through
+      }
+    }
+    if (cancelled) return clauseToast(tabId, { state: 'hide' });
+    const l = st && st.last;
+    if (l && l.ok === false) {
+      flashBadge(tabId, '!', '#bf6a02', l.error);
+      return clauseToast(tabId, { state: 'err', title: 'The paste did not land', sub: l.error || 'Check the Clause Assist pane in Figma.' });
+    }
+    const total = st && st.totals ? st.totals.frames : 0;
+    if (l && l.ok && typeof l.count === 'number' && l.count > 0) {
+      flashBadge(tabId, '✓', '#1a7f37', l.count + ' frame' + (l.count === 1 ? '' : 's') + ' pasted to Figma');
+      return clauseToast(tabId, { state: 'ok', title: l.count + ' frame' + (l.count === 1 ? '' : 's') + ' pasted to Figma', sub: total > l.count ? total + ' pasted so far' : 'Selected and zoomed to in your file' });
+    }
+    if (l && l.ok && typeof l.count === 'number') {
+      flashBadge(tabId, '!', '#bf6a02', 'Pasted, but nothing new appeared');
+      return clauseToast(tabId, { state: 'warn', title: 'Pasted, but nothing new appeared', sub: 'Check that the right Figma file and page is open.' });
+    }
+    flashBadge(tabId, '✓', '#1a7f37', 'Sent to Figma through Clause');
+    clauseToast(tabId, { state: 'ok', title: 'Pasted into Figma', sub: 'Clause did not report the frame count.' });
+  } catch (e) {
+    // Clause server not running: the copy is on the clipboard as usual.
+    clauseToast(tabId, { state: 'warn', title: 'Copied — Clause isn’t running', sub: 'Press ⌘V in Figma, or start Clause (npm run live) for automatic paste.' });
+  }
+}
+
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message && message.type === 'h2d-release' && sender.tab) {
     const tabId = sender.tab.id;
+    if (message.reason === 'copied') notifyClause(tabId); // validated copy: let Figma take it
     const started = captureStartedAt.get(tabId);
     const gotAt = Date.now();
     captureStartedAt.delete(tabId);

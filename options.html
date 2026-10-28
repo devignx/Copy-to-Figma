@@ -44,6 +44,13 @@
     <div class="size" id="sizeRow"><input type="number" id="width" min="200" max="8000"> × <input type="number" id="height" min="200" max="8000"> px</div>
     <div class="hint">The page is resized to this viewport for the capture, then restored right after it is copied. Chrome/Brave show a "debugging" bar while it runs.</div>
   </section>
+  <section>
+    <h2>Clause (Figma)</h2>
+    <label class="row"><span>Send each copy to Figma through Clause</span>
+      <span class="switch"><input type="checkbox" id="sendToClause"><span></span></span></label>
+    <div class="hint">After a successful copy, the Clause server presses paste in Figma for you (macOS). Needs <code>npm run live</code> running and Clause Assist open in Figma. If Clause isn't running, nothing happens and the copy stays on your clipboard.</div>
+    <div class="size" style="margin-top:10px"><input type="text" id="clauseUrl" style="width:100%;font:inherit;color:var(--fg);background:var(--field);border:1px solid var(--line);border-radius:6px;padding:6px 8px" placeholder="http://localhost:8787"></div>
+  </section>
   <div id="saved"></div>
 </main>
 <script src="options.js"></script>
