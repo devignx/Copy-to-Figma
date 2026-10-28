@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Copy to Figma — Preferences</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light dark; --bg:#fff; --fg:#1a1a1a; --muted:#6b6b6b; --line:#e3e3e3; --accent:#0d99ff; --field:#f5f5f5; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#1e1e1e; --fg:#f2f2f2; --muted:#a0a0a0; --line:#363636; --field:#2c2c2c; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui,-apple-system,sans-serif; }
+  main { max-width:520px; margin:48px auto; padding:0 20px; }
+  h1 { font-size:20px; margin:0 0 4px; } p.sub { color:var(--muted); margin:0 0 28px; }
+  section { border-top:1px solid var(--line); padding:18px 0; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:0 0 12px; }
+  label.row { display:flex; justify-content:space-between; align-items:center; gap:16px; cursor:pointer; }
+  .hint { color:var(--muted); font-size:12.5px; margin-top:6px; }
+  select, input[type=number] { font:inherit; color:var(--fg); background:var(--field); border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  select { width:100%; } input[type=number] { width:96px; }
+  .size { display:flex; align-items:center; gap:8px; margin-top:10px; }
+  .switch { position:relative; width:36px; height:20px; flex:none; }
+  .switch input { opacity:0; position:absolute; inset:0; margin:0; cursor:pointer; }
+  .switch span { position:absolute; inset:0; border-radius:10px; background:#8883; border:1px solid var(--line); transition:.15s; }
+  .switch span::after { content:""; position:absolute; top:2px; left:2px; width:14px; height:14px; border-radius:50%; background:#fff; box-shadow:0 1px 2px #0004; transition:.15s; }
+  .switch input:checked + span { background:var(--accent); border-color:var(--accent); }
+  .switch input:checked + span::after { left:18px; }
+  #saved { color:var(--muted); font-size:12.5px; height:18px; margin-top:16px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Copy to Figma</h1>
+  <p class="sub">These apply every time you copy with the toolbar icon or Cmd+Option+O (Ctrl+Alt+O).</p>
+
+  <section>
+    <h2>Claude header</h2>
+    <label class="row"><span>Include Claude header</span>
+      <span class="switch"><input type="checkbox" id="includeHeader"><span></span></span></label>
+    <div class="hint">Off: on artifact pages, paste only the artifact without the Claude title bar.</div>
+  </section>
+
+  <section>
+    <h2>Resolution</h2>
+    <select id="preset"></select>
+    <div class="size" id="sizeRow"><input type="number" id="width" min="200" max="8000"> × <input type="number" id="height" min="200" max="8000"> px</div>
+    <div class="hint">The page is resized to this viewport for the capture, then restored right after it is copied. Chrome/Brave show a "debugging" bar while it runs.</div>
+  </section>
+  <div id="saved"></div>
+</main>
+<script src="options.js"></script>
+</body>
+</html>

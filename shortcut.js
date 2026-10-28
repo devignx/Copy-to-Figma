@@ -13,9 +13,13 @@ window.addEventListener('keydown', (event) => {
   chrome.runtime.sendMessage({ type: 'copy-to-figma' });
 }, true);
 
-// Preferences menu in the capture toolbar (MAIN world) asks us to persist settings.
+// Messages from the capture toolbar (MAIN world): persist preferences and release the resolution emulation when the toolbar closes.
 window.addEventListener('message', (event) => {
-  if (event.source !== window || !event.data || event.data.type !== 'h2d-set-pref') return;
-  const { includeHeader } = event.data.prefs || {};
-  if (typeof includeHeader === 'boolean') chrome.storage.local.set({ includeHeader });
+  if (event.source !== window || !event.data || window.parent !== window) return;
+  const { type, prefs } = event.data;
+  if (type === 'h2d-set-pref' && prefs) {
+    chrome.storage.local.set(prefs);
+  } else if (type === 'h2d-release') {
+    chrome.runtime.sendMessage({ type: 'h2d-release' });
+  }
 });

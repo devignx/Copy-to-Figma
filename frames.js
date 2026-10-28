@@ -6,6 +6,8 @@
 (() => {
   const REQ = 'h2d-frame-request';
   const RES = 'h2d-frame-response';
+  const ACK = 'h2d-frame-ack';
+  const ACK_TIMEOUT_MS = 2500;
   const ARMED_MS = 120000;
   const CHILD_TIMEOUT_MS = 20000;
 
@@ -15,11 +17,29 @@
 
   let frameCounter = 0;
 
+  // Per-capture report: what each frame did. Shown in the preferences menu.
+  const describeFrame = () => {
+    const q = (sel) => document.querySelectorAll(sel).length;
+    return {
+      url: location.href.slice(0, 90),
+      size: innerWidth + 'x' + innerHeight,
+      visibility: document.visibilityState,
+      elements: q('*'),
+      canvas: q('canvas'),
+      video: q('video'),
+      iframes: q('iframe'),
+      sandbox: Array.from(document.querySelectorAll('iframe')).map((i) => i.getAttribute('sandbox')).filter((v) => v != null).join('|') || undefined
+    };
+  };
+  window.__h2dReport = [];
+  const note = (line) => window.__h2dReport.push(line);
+
   // Child side: serialize this frame on request from the parent.
   const onRequest = async (event) => {
     const data = event.data;
     if (!data || data.type !== REQ || window.parent === window) return;
     if (event.source !== window.parent || Date.now() > window.__h2dArmedUntil) return;
+    event.source.postMessage({ type: ACK, id: data.id }, '*');
     let payload = null;
     for (const skip of [false, true]) {
       window.__h2dSkipPrepare = skip;
@@ -34,8 +54,9 @@
       }
     }
     window.__h2dSkipPrepare = false;
+    const report = { frame: describeFrame(), ok: !!payload, kb: payload ? Math.round(payload.length / 1024) : 0, notes: window.__h2dReport.slice() };
     console.log('[copy-to-figma] frame', location.href.slice(0, 80), payload ? 'captured ' + Math.round(payload.length / 1024) + ' KB' : 'FAILED');
-    event.source.postMessage({ type: RES, id: data.id, payload }, '*');
+    event.source.postMessage({ type: RES, id: data.id, payload, report }, '*');
   };
   window.addEventListener('message', onRequest);
   window.__h2dFramesCleanup = () => window.removeEventListener('message', onRequest);
@@ -54,11 +75,18 @@
     if (node.childNodes) for (const child of node.childNodes) walk(child, fn);
   }
 
+  // Two-stage wait: a frame that never acknowledges (no script injected, blocked,
+  // still loading) is skipped after ACK_TIMEOUT_MS instead of stalling every level above it.
   function requestChild(iframe) {
     return new Promise((resolve) => {
       const win = iframe.contentWindow;
       if (!win) return resolve(null);
       const id = Math.random().toString(36).slice(2);
+      let timer = setTimeout(() => {
+        console.warn('[copy-to-figma] iframe did not acknowledge, skipping', iframe.src || '(srcdoc)');
+        note('SKIPPED (no acknowledgement; script not injected or frame blocked): ' + (iframe.src || '(srcdoc)').slice(0, 90) + (iframe.getAttribute('sandbox') != null ? ' [sandbox=' + iframe.getAttribute('sandbox') + ']' : ''));
+        finish(null);
+      }, ACK_TIMEOUT_MS);
       const finish = (value) => {
         clearTimeout(timer);
         window.removeEventListener('message', onMessage);
@@ -66,16 +94,29 @@
       };
       const onMessage = (event) => {
         const d = event.data;
-        if (event.source !== win || !d || d.type !== RES || d.id !== id) return;
-        finish(d.payload || null);
+        if (event.source !== win || !d || d.id !== id) return;
+        if (d.type === ACK) {
+          clearTimeout(timer);
+          timer = setTimeout(() => {
+            console.warn('[copy-to-figma] iframe took too long', iframe.src || '(srcdoc)');
+            note('SKIPPED (acknowledged but no result after ' + CHILD_TIMEOUT_MS / 1000 + 's): ' + (iframe.src || '(srcdoc)').slice(0, 90));
+            finish(null);
+          }, CHILD_TIMEOUT_MS);
+        } else if (d.type === RES) {
+          if (d.report) noteReport(d.report, iframe);
+          finish(d.payload || null);
+        }
       };
-      const timer = setTimeout(() => {
-        console.warn('[copy-to-figma] iframe did not respond', iframe.src);
-        finish(null);
-      }, CHILD_TIMEOUT_MS);
       window.addEventListener('message', onMessage);
       win.postMessage({ type: REQ, id }, '*');
     });
+  }
+
+  function noteReport(report, iframe) {
+    const fr = report.frame || {};
+    note((report.ok ? 'OK ' + report.kb + ' KB' : 'FAILED') + ' | ' + fr.url + ' | viewport ' + fr.size + ' (' + fr.visibility + ') | ' +
+      fr.elements + ' elements, canvas ' + fr.canvas + ', video ' + fr.video + ', iframes ' + fr.iframes + (fr.sandbox ? ', sandbox ' + fr.sandbox : ''));
+    for (const n of report.notes || []) note('   ' + n);
   }
 
   function sameRect(a, b) {
@@ -83,7 +124,7 @@
       Math.abs(a.width - b.width) < 1 && Math.abs(a.height - b.height) < 1;
   }
 
-  function prepareChild(child, prefix, ox, oy, cw, ch) {
+  function prepareChild(child, prefix, ox, oy, cw, ch, sx = 1, sy = 1) {
     const renamed = new Map();
     walk(child.root, (node) => {
       if (node.id) node.id = prefix + node.id;
@@ -94,12 +135,15 @@
       }
       const rect = node.rect;
       if (rect) {
-        rect.x += ox;
-        rect.y += oy;
+        // sx/sy: the iframe itself is scaled (CSS transform), so map child coordinates.
+        rect.x = ox + rect.x * sx;
+        rect.y = oy + rect.y * sy;
+        rect.width *= sx;
+        rect.height *= sy;
         if (rect.quad) {
           for (const p of ['p1', 'p2', 'p3', 'p4']) {
-            rect.quad[p].x += ox;
-            rect.quad[p].y += oy;
+            rect.quad[p].x = ox + rect.quad[p].x * sx;
+            rect.quad[p].y = oy + rect.quad[p].y * sy;
           }
         }
       }
@@ -108,8 +152,8 @@
     // node only spans its content: stretch it and inherit the body background.
     const root = child.root;
     if (root.rect) {
-      root.rect.width = Math.max(root.rect.width, cw);
-      root.rect.height = Math.max(root.rect.height, ch);
+      root.rect.width = Math.max(root.rect.width, cw * sx);
+      root.rect.height = Math.max(root.rect.height, ch * sy);
       if (root.rect.cssWidth != null) root.rect.cssWidth = Math.max(root.rect.cssWidth, cw);
       if (root.rect.cssHeight != null) root.rect.cssHeight = Math.max(root.rect.cssHeight, ch);
     }
@@ -147,7 +191,12 @@
 
 
   // ---- Preferences menu (three dots next to the toolbar's close button) -----
-  const PREF_DEFAULTS = { includeHeader: true };
+  const PREF_DEFAULTS = { includeHeader: true, resolution: { preset: 'auto', width: 1440, height: 900 } };
+  const PRESETS = [
+    ['auto', 'Current window', 0, 0], ['1920x1080', 'Desktop 1920 × 1080', 1920, 1080], ['1440x900', 'Laptop 1440 × 900', 1440, 900],
+    ['1280x800', 'Laptop 1280 × 800', 1280, 800], ['1024x768', 'Small 1024 × 768', 1024, 768], ['768x1024', 'Tablet 768 × 1024', 768, 1024],
+    ['390x844', 'Mobile 390 × 844', 390, 844], ['custom', 'Custom…', 0, 0]
+  ];
   const prefs = () => Object.assign({}, PREF_DEFAULTS, window.__h2dPrefs || {});
 
   function savePref(key, value) {
@@ -176,8 +225,32 @@
     dots.onmouseleave = () => { dots.style.background = 'transparent'; };
 
     let menu = null;
+    // Anchor under (or above) the dots button, aligned to its right edge, and keep the
+    // whole menu inside the visible viewport; scroll if it is taller than the space.
+    const placeMenu = () => {
+      if (!menu) return;
+      const M = 8;
+      const vw = document.documentElement.clientWidth || window.innerWidth;
+      const vh = document.documentElement.clientHeight || window.innerHeight;
+      const r = dots.getBoundingClientRect();
+      const width = menu.offsetWidth;
+      let left = r.right - width;
+      left = Math.max(M, Math.min(left, vw - width - M));
+      const spaceBelow = vh - r.bottom - M * 2;
+      const spaceAbove = r.top - M * 2;
+      const natural = menu.scrollHeight;
+      const below = spaceBelow >= natural || spaceBelow >= spaceAbove;
+      const avail = Math.max(120, below ? spaceBelow : spaceAbove);
+      menu.style.maxHeight = avail + 'px';
+      const height = Math.min(natural, avail);
+      const top = below ? r.bottom + M : r.top - M - height;
+      menu.style.left = left + 'px';
+      menu.style.top = Math.max(M, top) + 'px';
+      menu.style.visibility = 'visible';
+    };
     const closeMenu = () => {
       if (!menu) return;
+      window.removeEventListener('resize', placeMenu);
       menu.remove();
       menu = null;
       document.removeEventListener('pointerdown', onOutside, true);
@@ -199,15 +272,11 @@
       if (!shadow) return;
       menu = document.createElement('div');
       menu.setAttribute('role', 'menu');
-      const r = dots.getBoundingClientRect();
-      const below = r.top < window.innerHeight / 2;
       Object.assign(menu.style, {
-        position: 'fixed', zIndex: '2147483647', minWidth: '230px', padding: '10px 12px',
+        position: 'fixed', zIndex: '2147483647', width: '250px', maxWidth: 'calc(100vw - 16px)', padding: '10px 12px',
         borderRadius: '10px', background: theme.bg, color: theme.text, boxShadow: theme.shadow,
         fontFamily: theme.fontFamily, fontSize: theme.fontSize, lineHeight: theme.lineHeight,
-        fontWeight: theme.fontWeight, boxSizing: 'border-box',
-        right: Math.max(8, window.innerWidth - r.right) + 'px',
-        [below ? 'top' : 'bottom']: below ? r.bottom + 8 + 'px' : window.innerHeight - r.top + 8 + 'px'
+        fontWeight: theme.fontWeight, boxSizing: 'border-box', overflowY: 'auto', left: '0px', top: '0px', visibility: 'hidden'
       });
       const title = document.createElement('div');
       title.textContent = 'Preferences';
@@ -235,15 +304,100 @@
       row.append(label, sw);
       menu.appendChild(row);
 
+      // ---- Resolution ----
+      const resBox = document.createElement('div');
+      Object.assign(resBox.style, { marginTop: '12px', paddingTop: '10px', borderTop: '1px solid rgba(255,255,255,.15)' });
+      const resTitle = document.createElement('div');
+      resTitle.textContent = 'Resolution';
+      Object.assign(resTitle.style, { opacity: '.6', marginBottom: '6px' });
+      const field = { font: 'inherit', color: theme.text, background: 'rgba(255,255,255,.1)', border: '1px solid rgba(255,255,255,.2)',
+        borderRadius: '5px', padding: '4px 6px', boxSizing: 'border-box' };
+      const select = document.createElement('select');
+      Object.assign(select.style, field, { width: '100%' });
+      for (const [value, label] of PRESETS) {
+        const o = document.createElement('option');
+        o.value = value; o.textContent = label; o.style.color = '#000';
+        select.appendChild(o);
+      }
+      const sizeRow = document.createElement('div');
+      Object.assign(sizeRow.style, { display: 'flex', alignItems: 'center', gap: '6px', marginTop: '6px' });
+      const wIn = document.createElement('input');
+      const hIn = document.createElement('input');
+      for (const el of [wIn, hIn]) {
+        el.type = 'number'; el.min = '200'; el.max = '8000';
+        Object.assign(el.style, field, { width: '80px' });
+        el.addEventListener('keydown', (e) => e.stopPropagation());
+        el.addEventListener('keyup', (e) => e.stopPropagation());
+      }
+      const times = document.createElement('span');
+      times.textContent = '×';
+      const px = document.createElement('span');
+      px.textContent = 'px';
+      px.style.opacity = '.6';
+      sizeRow.append(wIn, times, hIn, px);
+
+      const resNote = document.createElement('div');
+      resNote.textContent = 'Saved automatically and used for every copy (icon / Cmd+Option+O). The page is resized only while copying, then restored.';
+      Object.assign(resNote.style, { opacity: '.55', marginTop: '6px', maxWidth: '230px', whiteSpace: 'normal' });
+
+      const syncRes = () => {
+        const r = prefs().resolution || PREF_DEFAULTS.resolution;
+        select.value = PRESETS.some((p) => p[0] === r.preset) ? r.preset : 'auto';
+        wIn.value = r.width; hIn.value = r.height;
+        const custom = select.value === 'custom';
+        wIn.disabled = hIn.disabled = !custom;
+        sizeRow.style.opacity = custom ? '1' : '.5';
+        sizeRow.style.display = select.value === 'auto' ? 'none' : 'flex';
+      };
+      const readRes = () => {
+        const p = PRESETS.find((x) => x[0] === select.value);
+        if (select.value === 'custom') return { preset: 'custom', width: Number(wIn.value) || 1440, height: Number(hIn.value) || 900 };
+        if (select.value === 'auto') return { preset: 'auto', width: prefs().resolution.width, height: prefs().resolution.height };
+        return { preset: select.value, width: p[2], height: p[3] };
+      };
+      select.onchange = () => { savePref('resolution', readRes()); syncRes(); };
+      wIn.onchange = hIn.onchange = () => savePref('resolution', readRes());
+      syncRes();
+      resBox.append(resTitle, select, sizeRow, resNote);
+      menu.appendChild(resBox);
+
       const hint = document.createElement('div');
       hint.textContent = 'Off: artifact pages paste only the artifact, without the Claude title bar. Applies to the next capture.';
       Object.assign(hint.style, { opacity: '.55', marginTop: '8px', maxWidth: '230px', whiteSpace: 'normal' });
-      menu.appendChild(hint);
+      menu.insertBefore(hint, resBox);
+
+      const rep = document.createElement('div');
+      Object.assign(rep.style, { marginTop: '10px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,.15)' });
+      const lines = [].concat(
+        window.__h2dTop ? ['TOP | ' + JSON.stringify(window.__h2dTop)] : [],
+        window.__h2dReport && window.__h2dReport.length ? window.__h2dReport : ['(no iframes captured)']
+      );
+      const text = lines.join('\n');
+      const summary = document.createElement('div');
+      const bad = lines.filter((l) => /SKIPPED|FAILED|NOT MATCHED/.test(l)).length;
+      summary.textContent = bad ? 'Last capture: ' + bad + ' frame problem' + (bad > 1 ? 's' : '') : 'Last capture: no frame problems';
+      Object.assign(summary.style, { opacity: '.8', marginBottom: '6px' });
+      const copy = document.createElement('button');
+      copy.type = 'button';
+      copy.textContent = 'Copy report';
+      Object.assign(copy.style, { border: 'none', borderRadius: '5px', padding: '4px 8px', background: 'rgba(255,255,255,.12)',
+        color: theme.text, cursor: 'pointer', font: 'inherit' });
+      copy.onclick = async (e) => {
+        e.stopPropagation();
+        try { await navigator.clipboard.writeText(text); copy.textContent = 'Copied'; }
+        catch (err) { copy.textContent = 'Copy failed'; console.log('[copy-to-figma] report\n' + text); }
+      };
+      rep.append(summary, copy);
+      menu.appendChild(rep);
+      console.log('[copy-to-figma] capture report\n' + text);
 
       shadow.appendChild(menu);
+      placeMenu();
+      window.addEventListener('resize', placeMenu);
       document.addEventListener('pointerdown', onOutside, true);
     };
 
+    closeButton.addEventListener('click', () => window.postMessage({ type: 'h2d-release' }, '*'));
     wrap.append(dots, closeButton);
     return wrap;
   };
@@ -527,6 +681,7 @@
   // Called by capture.js with the JSON payload for this frame; returns JSON with
   // each iframe's content attached under its IFRAME node.
   window.__h2dMerge = async (json) => {
+    window.__h2dReport = [];
     const iframes = collectIframes(document);
     if (!iframes.length) return json;
 
@@ -541,15 +696,16 @@
     const used = new Set();
     for (const iframe of iframes) {
       const r = iframe.getBoundingClientRect();
-      if (r.width < 1 || r.height < 1) continue;
+      if (r.width < 1 || r.height < 1) { note('ignored (zero size): ' + (iframe.src || '(srcdoc)').slice(0, 90)); continue; }
       const node = iframeNodes.find((n) => !used.has(n) && sameRect(n.rect, r));
-      if (!node) continue;
+      if (!node) { note('NOT MATCHED to a captured node: ' + (iframe.src || '(srcdoc)').slice(0, 90)); continue; }
       used.add(node);
       pairs.push({ iframe, node, r });
     }
     if (!pairs.length) return json;
 
     const results = await Promise.all(pairs.map((p) => requestChild(p.iframe)));
+    if (window === window.top) window.__h2dTop = describeFrame();
 
     // "Include Claude header" off: on a top-level page whose main content is one big
     // iframe (e.g. a Claude artifact), keep only that iframe's content.
@@ -577,8 +733,28 @@
       const oy = r.y + iframe.clientTop + (parseFloat(cs.paddingTop) || 0);
       const prefix = 'f' + (++frameCounter) + '-' + Math.random().toString(36).slice(2, 6) + '-';
       const isSolo = index === soloIndex;
-      const assets = prepareChild(child, prefix, isSolo ? 0 : ox, isSolo ? 0 : oy, iframe.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0), iframe.clientHeight - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0));
+      const layoutW = iframe.offsetWidth || r.width;
+      const layoutH = iframe.offsetHeight || r.height;
+      let sx = r.width / layoutW;
+      let sy = r.height / layoutH;
+      if (Math.abs(sx - 1) < 0.01) sx = 1;
+      if (Math.abs(sy - 1) < 0.01) sy = 1;
+      const assets = prepareChild(child, prefix, isSolo ? 0 : ox, isSolo ? 0 : oy, iframe.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0), iframe.clientHeight - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0), sx, sy);
 
+      const kids = (child.root.childNodes || []).length;
+      const rr = child.root.rect || {};
+      note('ATTACHED ' + (iframe.src || '(srcdoc)').slice(0, 60) + ' | iframe ' + Math.round(r.x) + ',' + Math.round(r.y) + ' ' +
+        Math.round(r.width) + 'x' + Math.round(r.height) + ' layout ' + layoutW + 'x' + layoutH + ' scale ' + sx.toFixed(3) + ',' + sy.toFixed(3) +
+        ' | child root ' + Math.round(rr.x) + ',' + Math.round(rr.y) + ' ' + Math.round(rr.width) + 'x' + Math.round(rr.height) +
+        ' children ' + kids + ' bg ' + ((child.root.styles || {}).backgroundColor || '-') +
+        ' | iframe style: opacity ' + getComputedStyle(iframe).opacity + ', visibility ' + getComputedStyle(iframe).visibility +
+        ', transform ' + getComputedStyle(iframe).transform.slice(0, 40));
+      if (window !== window.top) {
+        // Nested below the first level: present as plain containers so Figma's importer
+        // doesn't have to handle IFRAME/HTML nodes inside another frame's content.
+        node.tag = 'DIV';
+        child.root.tag = 'DIV';
+      }
       if (isSolo) { soloRoot = child.root; soloChild = child; }
       node.styles = Object.assign({}, node.styles, {
         overflow: 'hidden',
@@ -596,6 +772,36 @@
       mergeFonts(payload.fonts, child.fonts);
     });
 
+    if (window === window.top) {
+      const lines = [];
+      const clear = (c) => !c || c === 'transparent' || /^rgba\(.*,\s*0\)$/.test(c);
+      const dump = (n, d) => {
+        if (lines.length > 80 || d > 7) return;
+        if (n.nodeType === 3) return;
+        const st = n.styles || {};
+        const r = n.rect || {};
+        const texts = (n.childNodes || []).filter((c) => c.nodeType === 3 && c.text.trim()).length;
+        lines.push(' '.repeat(d) + n.tag + ' ' + Math.round(r.x) + ',' + Math.round(r.y) + ' ' + Math.round(r.width) + 'x' + Math.round(r.height) +
+          (clear(st.backgroundColor) ? '' : ' bg=' + st.backgroundColor) + (st.opacity && st.opacity !== '1' ? ' op=' + st.opacity : '') +
+          (st.display && st.display !== 'block' ? ' d=' + st.display : '') + (st.position && st.position !== 'static' ? ' pos=' + st.position : '') +
+          (st.overflow && st.overflow !== 'visible' ? ' ov=' + st.overflow : '') + (texts ? ' texts=' + texts : '') +
+          ' kids=' + (n.childNodes || []).length);
+        for (const c of n.childNodes || []) dump(c, d + 1);
+      };
+      dump(payload.root, 0);
+      let total = 0, maxDepth = 0;
+      const iframeInfo = [];
+      (function count(n, d) {
+        if (n.nodeType === 3) { total++; return; }
+        total++;
+        if (d > maxDepth) maxDepth = d;
+        if (n.tag === 'IFRAME') iframeInfo.push('depth ' + d + ' kids ' + (n.childNodes || []).length);
+        for (const c of n.childNodes || []) count(c, d + 1);
+      })(payload.root, 0);
+      lines.unshift('nodes ' + total + ', max depth ' + maxDepth + ', IFRAME nodes: ' + (iframeInfo.join('; ') || 'none'));
+      console.log('[copy-to-figma] tree dump\n' + lines.join('\n'));
+    }
+    console.log('[copy-to-figma] merge report (' + location.host.slice(0, 40) + ')\n' + window.__h2dReport.join('\n'));
     if (soloRoot) {
       payload.root = soloRoot;
       if (soloChild.documentRect) payload.documentRect = soloChild.documentRect;

@@ -7,7 +7,8 @@
     "activeTab",
     "scripting",
     "declarativeNetRequest",
-    "storage"
+    "storage",
+    "debugger"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -44,5 +45,9 @@
         "path": "rules.json"
       }
     ]
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   }
 }
